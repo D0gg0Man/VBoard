@@ -1,0 +1,23 @@
+[package]
+name = "vboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk = { version = "0.10", package = "gtk4", features = ["v4_14"] }  # matches your original working setup
+glib = "0.21"
+gio = "0.21"               # often needed implicitly, safe to include
+gtk4-layer-shell = "0.7"   # your original version — keep it
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Only needed in voskboard.rs (FFI + pulseaudio)
+libc = "0.2"
+
+[[bin]]
+name = "voskboard"
+path = "src/voskboard.rs"
+
+[[bin]]
+name = "vboard"
+path = "src/vboard.rs"     # ← config app binary name
