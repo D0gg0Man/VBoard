@@ -2,8 +2,10 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::rc::Rc;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::Write;
+use std::os::unix::io::{FromRawFd, AsFd};
+use std::collections::HashMap;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Button, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, glib};
 use gtk4_layer_shell::{Layer, Edge, KeyboardMode, LayerShell};
@@ -13,8 +15,22 @@ use toml;
 use std::fs::{self, read_to_string};
 use std::env;
 
+// D-Bus via zbus (replaces gdbus subprocess)
+use zbus::blocking::Connection as ZbusConnection;
+
+// Wayland virtual keyboard (replaces wtype subprocess)
+use wayland_client::{
+    Connection as WlConnection, Dispatch, QueueHandle,
+    protocol::{wl_registry, wl_seat},
+    globals::{registry_queue_init, GlobalListContents},
+};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
+
 // ───────────────────────────────────────────────
-// VOSK & PULSEAUDIO FFI
+// VOSK FFI
 // ───────────────────────────────────────────────
 #[link(name = "vosk")]
 extern "C" {
@@ -28,6 +44,9 @@ extern "C" {
     fn vosk_recognizer_free(recognizer: *mut std::ffi::c_void);
 }
 
+// ───────────────────────────────────────────────
+// PULSEAUDIO FFI
+// ───────────────────────────────────────────────
 #[repr(C)]
 pub struct pa_sample_spec {
     format: i32,
@@ -88,9 +107,13 @@ struct AudioState {
 
 thread_local! {
     static AUDIO_STATE: RefCell<Option<AudioState>> = RefCell::new(None);
+    // Cached zbus session-bus connection; created once, reused for every OSK poll.
+    static ZBUS_CONN: RefCell<Option<ZbusConnection>> = RefCell::new(None);
 }
 
-// Audio callback – outputs only clean spoken words
+// ───────────────────────────────────────────────
+// AUDIO CALLBACK
+// ───────────────────────────────────────────────
 extern "C" fn audio_callback(_stream: *mut std::ffi::c_void, _nbytes: usize, userdata: *mut std::ffi::c_void) {
     unsafe {
         if userdata.is_null() {
@@ -149,21 +172,259 @@ fn clean_vosk_text(json: &str) -> String {
         return s.trim_matches(&['{', '}', '"', ':', ' '][..]).to_string();
     }
     s = s[value_start..].to_string();
-    if let Some(end) = s.find("\"") {
+    if let Some(end) = s.find('"') {
         s = s[..end].to_string();
     }
-    s = s.trim_matches(&['"', ':', ' '][..]).trim().to_string();
-    s
+    s.trim_matches(&['"', ':', ' '][..]).trim().to_string()
 }
 
+// ───────────────────────────────────────────────
+// WAYLAND VIRTUAL KEYBOARD
+// Replaces the wtype subprocess with direct use of
+// zwp_virtual_keyboard_unstable_v1. A fresh Wayland
+// connection is opened per utterance (acceptable since
+// insert_text is only called at sentence boundaries).
+// ───────────────────────────────────────────────
+
+/// Minimal app-data type required by wayland-client's Dispatch machinery.
+struct VkAppData;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for VkAppData {
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        // GlobalListContents is maintained internally by registry_queue_init.
+    }
+}
+
+// Neither manager nor virtual-keyboard send any events back to the client,
+// so a no-op Dispatch implementation is sufficient for both.
+wayland_client::delegate_noop!(VkAppData: ignore wl_seat::WlSeat);
+wayland_client::delegate_noop!(VkAppData: ignore ZwpVirtualKeyboardManagerV1);
+wayland_client::delegate_noop!(VkAppData: ignore ZwpVirtualKeyboardV1);
+
+/// Build a minimal XKB keymap that assigns one dedicated keycode to every
+/// unique character that needs to be typed. Keycodes start at XKB 9
+/// (= Linux evdev 1) so they do not collide with real hardware keys when
+/// processed through this isolated virtual keyboard.
+fn generate_keymap(chars: &[char]) -> String {
+    // Start at XKB 16 (evdev 8).  evdev 0-7 covers kernel-reserved codes
+    // (ESC, digit row, etc.) that some compositors treat specially even with
+    // a custom keymap loaded.  Starting at 16 keeps us well clear of them.
+    const XKB_BASE: usize = 16; // evdev = XKB - 8 = 8
+    let max_xkb = (XKB_BASE + chars.len().saturating_sub(1)).max(XKB_BASE) as u32;
+    let mut keycodes = String::new();
+    let mut symbols = String::new();
+
+    for (i, &c) in chars.iter().enumerate() {
+        let xkb_kc = XKB_BASE + i; // evdev = xkb_kc - 8 = i + 8
+        let name = format!("VK{:03}", i);
+        keycodes.push_str(&format!("        <{}> = {};\n", name, xkb_kc));
+        symbols.push_str(&format!("        key <{}> {{ [ U{:04X} ] }};\n", name, c as u32));
+    }
+
+    format!(
+        "xkb_keymap {{\n\
+         \txkb_keycodes \"vk\" {{\n\
+         \t\tminimum = 8;\n\
+         \t\tmaximum = {};\n\
+         {}\t}};\n\
+         \txkb_types \"vk\" {{ include \"complete\" }};\n\
+         \txkb_compat \"vk\" {{ include \"complete\" }};\n\
+         \txkb_symbols \"vk\" {{\n\
+         {}\t}};\n\
+         \txkb_geometry \"vk\" {{}};\n\
+         }};",
+        max_xkb, keycodes, symbols
+    )
+}
+
+/// Monotonic-ish timestamp in milliseconds for Wayland key events.
+fn now_ms() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32
+}
+
+/// Type `text` into whatever surface currently has keyboard focus by
+/// injecting key events through the Wayland virtual keyboard protocol.
 fn insert_text_into_focused_field(text: &str) {
-    let text_with_space = format!(" {}", text);
-    let _ = Command::new("wtype")
-        .arg(&text_with_space)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    println!("→ Sent to wtype: {}", text_with_space);
+    if text.is_empty() {
+        return;
+    }
+
+    // Prepend a space so dictated words don't run into existing text.
+    let text_spaced = format!(" {}", text);
+
+    // Collect unique characters (first-occurrence order).
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<char> = text_spaced.chars().filter(|c| seen.insert(*c)).collect();
+
+    // Map each unique char to an evdev keycode.
+    //   XKB keycode = index + 16  →  evdev keycode = XKB - 8 = index + 8
+    let char_to_kc: HashMap<char, u32> = unique
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, (i + 8) as u32))
+        .collect();
+
+    let keymap_str = generate_keymap(&unique);
+
+    // Open a dedicated Wayland connection.  GTK's own connection is not
+    // accessible from Rust, and having two connections to the compositor is
+    // perfectly valid.
+    let conn = match WlConnection::connect_to_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("VK: Wayland connect failed: {}", e);
+            return;
+        }
+    };
+
+    let (globals, mut queue) = match registry_queue_init::<VkAppData>(&conn) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("VK: registry init failed: {}", e);
+            return;
+        }
+    };
+
+    let qh = queue.handle();
+    let mut state = VkAppData;
+
+    let seat = match globals.bind::<wl_seat::WlSeat, _, _>(&qh, 1..=7, ()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("VK: compositor has no wl_seat: {}", e);
+            return;
+        }
+    };
+
+    let vk_manager = match globals.bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("VK: compositor has no zwp_virtual_keyboard_manager_v1: {}", e);
+            return;
+        }
+    };
+
+    // Flush the bind requests and process any initial events.
+    if let Err(e) = queue.roundtrip(&mut state) {
+        eprintln!("VK: initial roundtrip failed: {}", e);
+        return;
+    }
+
+    let vk = vk_manager.create_virtual_keyboard(&seat, &qh, ());
+
+    // ── Write the XKB keymap into an anonymous shared-memory file ──
+    let keymap_bytes = keymap_str.as_bytes();
+    let keymap_size = (keymap_bytes.len() + 1) as u32; // +1 for null terminator
+
+    let raw_fd = unsafe {
+        libc::memfd_create(b"vk-keymap\0".as_ptr() as *const libc::c_char, 0)
+    };
+    if raw_fd < 0 {
+        eprintln!("VK: memfd_create failed: {}", std::io::Error::last_os_error());
+        return;
+    }
+
+    // Safety: raw_fd is a valid, newly created fd owned by us.
+    let mut keymap_file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    if keymap_file.write_all(keymap_bytes).is_err()
+        || keymap_file.write_all(&[0u8]).is_err()
+    {
+        eprintln!("VK: failed to write keymap to memfd");
+        return;
+    }
+
+    // WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 = 1
+    // The Wayland backend dups the fd internally before sending.
+    vk.keymap(1, keymap_file.as_fd(), keymap_size);
+
+    // Roundtrip so the compositor has loaded and compiled the keymap
+    // before our key events arrive.
+    if let Err(e) = queue.roundtrip(&mut state) {
+        eprintln!("VK: keymap roundtrip failed: {}", e);
+        return;
+    }
+    drop(keymap_file); // fd is no longer needed after the roundtrip
+
+    // ── Queue all key press / release events ──
+    // Each character gets 30 ms between events; press duration is 15 ms.
+    let base_t = now_ms();
+    for (i, c) in text_spaced.chars().enumerate() {
+        if let Some(&kc) = char_to_kc.get(&c) {
+            let t = base_t.wrapping_add(i as u32 * 30);
+            vk.key(t, kc, 1);      // WL_KEYBOARD_KEY_STATE_PRESSED  = 1
+            vk.key(t + 15, kc, 0); // WL_KEYBOARD_KEY_STATE_RELEASED = 0
+        }
+    }
+
+    // Roundtrip after key events: this blocks until the compositor has
+    // processed everything in the queue.  A bare flush() returns as soon as
+    // the bytes are written to the socket — the compositor may not have read
+    // them yet, and dropping the connection immediately after would cause it
+    // to discard the in-flight events entirely.
+    if let Err(e) = queue.roundtrip(&mut state) {
+        eprintln!("VK: final roundtrip failed: {}", e);
+    }
+
+    println!("→ Typed via virtual keyboard: {}", text_spaced.trim());
+}
+
+// ───────────────────────────────────────────────
+// D-BUS OSK CHECK via zbus
+// Replaces the gdbus subprocess. The session-bus
+// connection is created once and cached for the
+// lifetime of the process.
+// ───────────────────────────────────────────────
+
+fn get_or_init_zbus() -> Option<ZbusConnection> {
+    ZBUS_CONN.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            match ZbusConnection::session() {
+                Ok(c) => *opt = Some(c),
+                Err(e) => eprintln!("zbus: session connection failed: {}", e),
+            }
+        }
+        // ZbusConnection is Arc-backed, so clone is cheap.
+        opt.clone()
+    })
+}
+
+fn is_osk_visible() -> bool {
+    let conn = match get_or_init_zbus() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    let result: Result<bool, Box<dyn std::error::Error>> = (|| {
+        use zbus::blocking::fdo::PropertiesProxy;
+        let proxy = PropertiesProxy::builder(&conn)
+            .destination("sm.puri.OSK0")?
+            .path("/sm/puri/OSK0")?
+            .build()?;
+        let val = proxy.get("sm.puri.OSK0".try_into()?, "Visible")?;
+        Ok(bool::try_from(val)?)
+    })();
+
+    match result {
+        Ok(v) => {
+            println!("OSK Visible: {}", v);
+            v
+        }
+        Err(e) => {
+            eprintln!("zbus: OSK visibility check failed: {}", e);
+            false
+        }
+    }
 }
 
 // ───────────────────────────────────────────────
@@ -295,37 +556,7 @@ fn stop_recording(config: &Config) {
 }
 
 // ───────────────────────────────────────────────
-// OSK VISIBILITY CHECK
-// ───────────────────────────────────────────────
-fn is_osk_visible() -> bool {
-    let output = Command::new("gdbus")
-        .arg("call")
-        .arg("--session")
-        .arg("--dest")
-        .arg("sm.puri.OSK0")
-        .arg("--object-path")
-        .arg("/sm/puri/OSK0")
-        .arg("--method")
-        .arg("org.freedesktop.DBus.Properties.Get")
-        .arg("sm.puri.OSK0")
-        .arg("Visible")
-        .output();
-
-    match output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            println!("OSK Visible check: {}", stdout);
-            stdout.contains("true") || stdout.contains("True")
-        }
-        Err(e) => {
-            eprintln!("gdbus call failed: {}", e);
-            false
-        }
-    }
-}
-
-// ───────────────────────────────────────────────
-// GTK UI + D-Bus + FALLBACK TIMER
+// GTK UI + FALLBACK TIMER
 // ───────────────────────────────────────────────
 fn build_ui(app: &Application, model_path: String, config: Config) {
     let window = ApplicationWindow::builder()
@@ -403,7 +634,6 @@ fn build_ui(app: &Application, model_path: String, config: Config) {
         return;
     }
 
-    // OSK visibility detection + fallback timer
     let previous_visible = Rc::new(RefCell::new(false));
 
     let initial_visible = is_osk_visible();
@@ -424,7 +654,7 @@ fn build_ui(app: &Application, model_path: String, config: Config) {
         println!("Initial check: OSK hidden → button hidden");
     }
 
-    // Fallback timer – poll every 2 seconds
+    // Fallback timer – poll every 2 seconds via zbus
     let window_clone = window.clone();
     let previous_visible_clone = previous_visible.clone();
     let model_path_clone2 = model_path.clone();
@@ -470,6 +700,9 @@ fn build_ui(app: &Application, model_path: String, config: Config) {
     println!("Fallback timer started (2s interval)");
 }
 
+// ───────────────────────────────────────────────
+// CONFIG
+// ───────────────────────────────────────────────
 #[derive(Deserialize, Clone, Default)]
 struct Config {
     model_size: String,
@@ -477,27 +710,31 @@ struct Config {
     always_visible: bool,
 }
 
+// ───────────────────────────────────────────────
+// MAIN
+// ───────────────────────────────────────────────
 fn main() {
     std::env::set_var("GDK_BACKEND", "wayland");
 
-    // Load config
     let home = env::var("HOME").expect("HOME env var");
     let config_dir = format!("{}/.config/voskboard", home);
     fs::create_dir_all(&config_dir).ok();
     let config_path = format!("{}/config.toml", config_dir);
-    let config_str = read_to_string(&config_path).unwrap_or_else(|_| r#"
+    let config_str = read_to_string(&config_path).unwrap_or_else(|_| {
+        r#"
 model_size = "none"
 ram_saving = true
 always_visible = false
-"#.to_string());
+"#
+        .to_string()
+    });
     let mut config: Config = toml::from_str(&config_str).unwrap_or_default();
     if config.model_size.is_empty() {
         config.model_size = "none".to_string();
     }
 
-    // Determine model path
     let model_folder = match config.model_size.as_str() {
-        "none" => return, // no model
+        "none" => return,
         "small" => "vosk-model-small-en-us-0.15",
         "medium" => "vosk-model-en-us-0.22",
         "large" => "vosk-model-en-us-0.42-gigaspeech",
@@ -516,19 +753,24 @@ always_visible = false
     };
     let model_path = format!("{}/.local/share/vosk-models/{}", home, model_folder);
 
-    // Initialize PulseAudio context
     unsafe {
         let gctx = glib::MainContext::default().as_ptr() as *mut std::ffi::c_void;
         let glib_mainloop = pa_glib_mainloop_new(gctx);
-        if glib_mainloop.is_null() { panic!("pa_glib_mainloop_new failed"); }
+        if glib_mainloop.is_null() {
+            panic!("pa_glib_mainloop_new failed");
+        }
         let api = pa_glib_mainloop_get_api(glib_mainloop);
         let ctx_name = CString::new("vosk-mic-toggle").unwrap();
         let ctx = pa_context_new(api, ctx_name.as_ptr() as *const i8);
-        if ctx.is_null() { panic!("pa_context_new failed"); }
+        if ctx.is_null() {
+            panic!("pa_context_new failed");
+        }
         let ret = pa_context_connect(ctx, ptr::null(), 0, ptr::null_mut());
         if ret < 0 {
             let err = if !pa_strerror(ret).is_null() {
-                CStr::from_ptr(pa_strerror(ret) as *const u8).to_string_lossy().into_owned()
+                CStr::from_ptr(pa_strerror(ret) as *const u8)
+                    .to_string_lossy()
+                    .into_owned()
             } else {
                 "unknown error".to_string()
             };
@@ -546,7 +788,6 @@ always_visible = false
         }));
     }
 
-    // Pre-load model if not ram_saving
     if !config.ram_saving && config.model_size != "none" {
         AUDIO_STATE.with(|cell| {
             let mut opt = cell.borrow_mut();
