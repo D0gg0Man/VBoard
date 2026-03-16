@@ -1,22 +1,23 @@
 [package]
 name = "vboard"
-version = "0.1.0"
+version = "0.2.5"
 edition = "2021"
 
 [dependencies]
-gtk = { version = "0.10", package = "gtk4", features = ["v4_14"] }  # matches your original working setup
+gtk = { version = "0.10", package = "gtk4", features = ["v4_14"] }
 glib = "0.21"
-gio = "0.21"               # often needed implicitly, safe to include
-gtk4-layer-shell = "0.7"   # your original version — keep it
+gio = "0.21"
+gtk4-layer-shell = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 zbus = { version = "4", features = ["blocking"] }
 wayland-client = "0.31"
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
-
-
-# Only needed in voskboard.rs (FFI + pulseaudio)
 libc = "0.2"
+nlprule = "0.6"
+
+[build-dependencies]
+nlprule-build = "0.6" # must match nlprule version
 
 [[bin]]
 name = "voskboard"
@@ -24,4 +25,4 @@ path = "src/voskboard.rs"
 
 [[bin]]
 name = "vboard"
-path = "src/vboard.rs"     # ← config app binary name
+path = "src/vboard.rs"

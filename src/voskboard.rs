@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::io::Write;
 use std::os::unix::io::{FromRawFd, AsFd};
 use std::collections::HashMap;
+use std::process::Command;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Button, CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, glib};
 use gtk4_layer_shell::{Layer, Edge, KeyboardMode, LayerShell};
@@ -17,6 +18,9 @@ use std::env;
 
 // D-Bus via zbus (replaces gdbus subprocess)
 use zbus::blocking::Connection as ZbusConnection;
+
+// nlprule grammar correction (English + German only)
+use nlprule::{Rules, Tokenizer, rules_filename, tokenizer_filename};
 
 // Wayland virtual keyboard (replaces wtype subprocess)
 use wayland_client::{
@@ -103,12 +107,216 @@ struct AudioState {
     pa_stream: *mut std::ffi::c_void,
     is_recording: bool,
     is_model_loaded: bool,
+    // Audio enhancement — None when disabled or unavailable.
+    echo_cancel_module_id: Option<u32>,
+    enhanced_source: Option<CString>,
 }
 
 thread_local! {
     static AUDIO_STATE: RefCell<Option<AudioState>> = RefCell::new(None);
     // Cached zbus session-bus connection; created once, reused for every OSK poll.
     static ZBUS_CONN: RefCell<Option<ZbusConnection>> = RefCell::new(None);
+    // Language detected from model_size — drives punctuation and grammar logic.
+    static VOICE_LANG: RefCell<VoiceLang> = RefCell::new(VoiceLang::English);
+    // nlprule grammar engine — only populated for English and German.
+    // None for all other languages; no RAM cost for non-supported languages.
+    static NLPRULE: RefCell<Option<(Rules, Tokenizer)>> = RefCell::new(None);
+    // Runtime feature toggles — written once from config in main(), read in
+    // audio_callback (a C function pointer that cannot hold Rc/config refs).
+    static FEATURE_FLAGS: RefCell<FeatureFlags> = RefCell::new(FeatureFlags::default());
+}
+
+// ───────────────────────────────────────────────
+// FEATURE FLAGS
+// Written once at startup from config; read cheaply
+// from the audio callback via thread_local.
+// ───────────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct FeatureFlags {
+    /// Capitalise first letter of each utterance (and, via nlprule, proper
+    /// nouns/German nouns).  Skipped for CJK languages automatically.
+    auto_capitalize: bool,
+    /// Append a terminal '.' or '?' based on question-word heuristics.
+    auto_punctuate: bool,
+    /// Run nlprule grammar correction (English + German only).
+    nlp_correction: bool,
+}
+
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self { auto_capitalize: true, auto_punctuate: true, nlp_correction: true }
+    }
+}
+
+// ───────────────────────────────────────────────
+// LANGUAGE DETECTION
+// Derived once from config.model_size at startup.
+// ───────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VoiceLang {
+    English,
+    German,
+    Russian,
+    Dutch,
+    French,
+    Spanish,
+    Italian,
+    Swedish,
+    Polish,
+    // CJK languages use their own punctuation systems; we leave their
+    // output untouched and do not run Harper on them.
+    Korean,
+    Chinese,
+    Japanese,
+}
+
+impl VoiceLang {
+    fn from_model_size(s: &str) -> Self {
+        match s {
+            "small-german"   => Self::German,
+            "small-russian"  => Self::Russian,
+            "small-dutch"    => Self::Dutch,
+            "small-french"   => Self::French,
+            "small-spanish"  => Self::Spanish,
+            "small-italian"  => Self::Italian,
+            "small-swedish"  => Self::Swedish,
+            "small-polish"   => Self::Polish,
+            "small-korean"   => Self::Korean,
+            "small-chinese"  => Self::Chinese,
+            "small-japanese" => Self::Japanese,
+            _                => Self::English, // small / medium / large / unknown
+        }
+    }
+
+    /// Only English and German are supported by nlprule.
+    /// All other languages skip grammar correction entirely.
+    fn uses_nlprule(self) -> bool {
+        matches!(self, Self::English | Self::German)
+    }
+
+    /// CJK scripts do not use Latin-alphabet capitalisation.
+    fn supports_capitalization(self) -> bool {
+        !matches!(self, Self::Korean | Self::Chinese | Self::Japanese)
+    }
+
+    /// CJK scripts have their own punctuation conventions; don't inject
+    /// Western sentence-ending marks into them.
+    fn uses_western_punctuation(self) -> bool {
+        !matches!(self, Self::Korean | Self::Chinese | Self::Japanese)
+    }
+
+    /// Question-starter words for this language.  These are the words that,
+    /// when they begin an utterance, strongly suggest a question rather than
+    /// a statement.
+    fn question_starters(self) -> &'static [&'static str] {
+        match self {
+            Self::English => &[
+                // Core WH-question words (interrogatives)
+            "who", "what", "where", "when", "why", "how", "which", "whose", "whom",
+
+            // WH- compounds / extensions (very frequent in real speech)
+            "how many", "how much", "how long", "how far", "how often", "how old",
+            "how come", "what kind", "what time", "what about", "what if", "why don't",
+            "whoever", "whatever", "whenever", "wherever", "whichever",
+
+            // Forms of BE (very common question openers)
+            "is", "are", "was", "were", "am", "isn't", "aren't", "wasn't", "weren't",
+
+            // Auxiliary DO forms
+            "do", "does", "did", "don't", "doesn't", "didn't",
+
+            // HAVE forms
+            "have", "has", "had", "haven't", "hasn't", "hadn't",
+
+            // Modals (extremely common)
+            "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            "can't", "couldn't", "won't", "wouldn't", "shan't", "shouldn't", "may not", "might not", "mustn't",
+
+            // Contractions that frequently start casual questions
+            "isn't", "aren't", "wasn't", "weren't",
+            "don't", "doesn't", "didn't",
+            "haven't", "hasn't", "hadn't",
+            "can't", "couldn't", "won't", "wouldn't", "shouldn't", "mustn't",
+            "who's", "what's", "where's", "when's", "why's", "how's",
+            "who're", "what're", "where're", "when're",  // less common but do occur
+
+            // Other frequent casual / spoken starters
+            "are", "isn't it", "aren't you", "don't you", "didn't you",
+            "can you", "could you", "will you", "would you",
+            "shall we", "should I", "may I", "might I",
+            ],
+            Self::German => &[
+                // W-Fragen
+                "wer", "was", "wo", "wohin", "woher", "wann", "warum", "wie",
+                "welcher", "welche", "welches",
+                // Entscheidungsfragen start with a verb — list common auxiliaries
+                "ist", "sind", "war", "waren", "bin",
+                "hat", "haben", "hatte", "hatten",
+                "wird", "werden", "würde", "würden",
+                "kann", "können", "konnte",
+                "darf", "dürfen", "muss", "müssen",
+                "soll", "sollen",
+            ],
+            Self::Russian => &[
+                // Вопросительные слова
+                "кто", "что", "где", "куда", "откуда", "когда", "почему",
+                "зачем", "как", "какой", "какая", "какое", "какие", "который",
+                // Частицы и связки
+                "ли", "разве", "неужели",
+                "есть", "был", "была", "было", "были",
+                "будет", "будут",
+            ],
+            Self::Dutch => &[
+                "wie", "wat", "waar", "waarheen", "wanneer", "waarom", "hoe", "welke",
+                "is", "zijn", "was", "waren",
+                "heeft", "hebben", "had", "hadden",
+                "kan", "kunnen", "mag", "zal", "zullen", "moet", "moeten",
+            ],
+            Self::French => &[
+                "qui", "que", "quoi", "où", "quand", "pourquoi", "comment",
+                "quel", "quelle", "quels", "quelles", "lequel",
+                "est", "êtes", "es",
+                "as", "avez", "avons", "ont",
+                "peux", "pouvez", "peut", "peuvent",
+                "faut", "dois", "devez",
+            ],
+            Self::Spanish => &[
+                "quién", "qué", "dónde", "adónde", "cuándo", "por qué",
+                "cómo", "cuál", "cuánto", "cuánta", "cuántos", "cuántas",
+                "es", "son", "era", "eran",
+                "has", "ha", "han", "había",
+                "puede", "pueden", "puedes",
+                "hay", "tengo", "tienes",
+            ],
+            Self::Italian => &[
+                "chi", "che", "cosa", "dove", "quando", "perché", "come",
+                "quale", "quali", "quanto", "quanta",
+                "è", "sei", "siete", "sono",
+                "hai", "ha", "abbiamo", "avete", "hanno",
+                "puoi", "può", "possiamo",
+                "devi", "deve",
+            ],
+            Self::Swedish => &[
+                "vem", "vad", "var", "vart", "varifrån", "när", "varför", "hur",
+                "vilken", "vilket", "vilka",
+                "är", "var", "var",
+                "har", "hade",
+                "kan", "ska", "skall", "bör", "måste", "får",
+            ],
+            Self::Polish => &[
+                "kto", "co", "gdzie", "dokąd", "skąd", "kiedy", "dlaczego",
+                "jak", "który", "która", "które", "ile",
+                "jest", "są", "był", "była", "było", "byli",
+                "ma", "mają", "miał",
+                "może", "mogą", "czy",
+            ],
+            // CJK — question/statement distinction is grammatically marked
+            // differently (particles, intonation).  Return an empty list and
+            // let add_terminal_punctuation use the language-specific path.
+            Self::Korean | Self::Chinese | Self::Japanese => &[],
+        }
+    }
 }
 
 // ───────────────────────────────────────────────
@@ -139,8 +347,34 @@ extern "C" fn audio_callback(_stream: *mut std::ffi::c_void, _nbytes: usize, use
                     let json = CStr::from_ptr(result_ptr as *const u8).to_string_lossy();
                     let text = clean_vosk_text(&json);
                     if !text.trim().is_empty() {
-                        println!("{}", text);
-                        insert_text_into_focused_field(&text);
+                        let flags = FEATURE_FLAGS.with(|f| *f.borrow());
+                        let lang  = VOICE_LANG.with(|c| *c.borrow());
+
+                        // 1. Terminal punctuation
+                        let out = if flags.auto_punctuate {
+                            add_terminal_punctuation(&text)
+                        } else {
+                            text.clone()
+                        };
+
+                        // 2. Sentence-start capitalisation
+                        //    Skipped for CJK; nlprule (step 3) handles proper
+                        //    nouns / German noun caps when also enabled.
+                        let out = if flags.auto_capitalize && lang.supports_capitalization() {
+                            capitalize_first(&out)
+                        } else {
+                            out
+                        };
+
+                        // 3. NLP grammar correction (en/de only)
+                        let out = if flags.nlp_correction {
+                            apply_grammar_corrections(&out)
+                        } else {
+                            out
+                        };
+
+                        println!("{} → {}", text, out);
+                        insert_text_into_focused_field(&out);
                     }
                 }
             } else {
@@ -176,6 +410,91 @@ fn clean_vosk_text(json: &str) -> String {
         s = s[..end].to_string();
     }
     s.trim_matches(&['"', ':', ' '][..]).trim().to_string()
+}
+
+// ───────────────────────────────────────────────
+// PUNCTUATION RESTORATION
+// Vosk outputs raw words with no punctuation.
+// Language-aware: uses per-language question starters,
+// skips Western punctuation for CJK scripts entirely.
+//
+// Pipeline:  vosk → add_terminal_punctuation → apply_grammar_corrections → type
+// ───────────────────────────────────────────────
+
+fn add_terminal_punctuation(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let lang = VOICE_LANG.with(|c| *c.borrow());
+
+    // CJK: leave the text completely untouched — the models sometimes
+    // already include native punctuation, and injecting Western marks
+    // would produce malformed output.
+    if !lang.uses_western_punctuation() {
+        return trimmed.to_string();
+    }
+
+    // Don't double-add punctuation if Vosk already supplied it.
+    if matches!(trimmed.chars().last(), Some('.' | '?' | '!' | '…')) {
+        return trimmed.to_string();
+    }
+
+    let first_word = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let first_word = first_word.trim_matches(|c: char| !c.is_alphabetic());
+
+    if lang.question_starters().contains(&first_word) {
+        format!("{}?", trimmed)
+    } else {
+        format!("{}.", trimmed)
+    }
+}
+
+// ───────────────────────────────────────────────
+// TEXT HELPERS
+// ───────────────────────────────────────────────
+
+/// Capitalise only the very first character of a string.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None    => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+// ───────────────────────────────────────────────
+// NLPRULE GRAMMAR CORRECTION
+// Applies rule-based grammatical error correction
+// using nlprule (LanguageTool rules, Rust-native).
+// Only active for English and German — all other
+// languages return the input unchanged, and the
+// NLPRULE thread_local stays None (zero RAM cost).
+//
+// Capitalisation is applied upstream in the pipeline
+// (step 2 of the audio callback) before this is called,
+// so nlprule's POS tagger always sees a proper sentence.
+// ───────────────────────────────────────────────
+fn apply_grammar_corrections(text: &str) -> String {
+    NLPRULE.with(|cell| {
+        let opt = cell.borrow();
+        match opt.as_ref() {
+            Some((rules, tokenizer)) => {
+                let corrected = rules.correct(text, tokenizer);
+                if corrected != text {
+                    println!("nlprule: {:?} → {:?}", text, corrected);
+                }
+                corrected
+            }
+            // Language not supported by nlprule — pass through unchanged.
+            None => text.to_string(),
+        }
+    })
 }
 
 // ───────────────────────────────────────────────
@@ -479,6 +798,76 @@ fn unload_vosk_model(state: &mut AudioState) {
 }
 
 // ───────────────────────────────────────────────
+// AUDIO ENHANCEMENT
+// Uses PulseAudio's module-echo-cancel with the
+// WebRTC backend to apply:
+//   • Noise suppression
+//   • Echo cancellation
+//   • Automatic gain control (AGC)
+//   • High-pass filter (removes low rumble)
+//   • Extended filter for better AEC accuracy
+//
+// A virtual source named "voskboard_mic_enhanced"
+// is created; we record from that instead of the
+// raw default source.  The module is unloaded on
+// clean shutdown.
+// ───────────────────────────────────────────────
+
+const ENHANCED_SOURCE_NAME: &str = "voskboard_mic_enhanced";
+
+/// Load module-echo-cancel.  Returns (module_id, source_name_cstring) on
+/// success, or None if the module is unavailable or pactl fails.
+fn setup_audio_enhancement() -> Option<(u32, CString)> {
+    let output = Command::new("pactl")
+        .args([
+            "load-module",
+            "module-echo-cancel",
+            "aec_method=webrtc",
+            &format!("source_name={}", ENHANCED_SOURCE_NAME),
+            &format!("source_props=device.description=VoskboardMic"),
+            // WebRTC AEC parameters:
+            //   noise_suppression  — suppress background noise
+            //   analog_agc         — hardware-level gain normalisation
+            //   digital_agc        — disabled (can distort quiet speech)
+            //   extended_filter    — longer echo tail, better accuracy
+            //   high_pass_filter   — remove sub-100 Hz rumble
+            "aec_args=noise_suppression=true analog_agc=true digital_agc=false \
+                      extended_filter=true high_pass_filter=true",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        eprintln!(
+            "Audio enhancement: pactl load-module failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return None;
+    }
+
+    let module_id: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+
+    let source = CString::new(ENHANCED_SOURCE_NAME).ok()?;
+    println!("Audio enhancement active — module {} source '{}'", module_id, ENHANCED_SOURCE_NAME);
+    Some((module_id, source))
+}
+
+/// Unload the echo-cancel module when shutting down.
+fn teardown_audio_enhancement(module_id: u32) {
+    let status = Command::new("pactl")
+        .args(["unload-module", &module_id.to_string()])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("Audio enhancement module {} unloaded", module_id),
+        Ok(s) => eprintln!("Audio enhancement unload exited {:?}", s.code()),
+        Err(e) => eprintln!("Audio enhancement unload failed: {}", e),
+    }
+}
+
+// ───────────────────────────────────────────────
 // RECORDING CONTROL
 // ───────────────────────────────────────────────
 fn start_recording(model_path: &str, config: &Config) {
@@ -511,7 +900,11 @@ fn start_recording(model_path: &str, config: &Config) {
                     return;
                 }
                 pa_stream_set_read_callback(new_stream, Some(audio_callback), state.recognizer);
-                let ret = pa_stream_connect_record(new_stream, ptr::null(), ptr::null(), 0);
+                let device_ptr = state.enhanced_source
+                    .as_ref()
+                    .map(|s| s.as_ptr() as *const i8)
+                    .unwrap_or(ptr::null());
+                let ret = pa_stream_connect_record(new_stream, device_ptr, ptr::null(), 0);
                 if ret < 0 {
                     let err = if !pa_strerror(ret).is_null() {
                         CStr::from_ptr(pa_strerror(ret) as *const u8).to_string_lossy().into_owned()
@@ -703,11 +1096,42 @@ fn build_ui(app: &Application, model_path: String, config: Config) {
 // ───────────────────────────────────────────────
 // CONFIG
 // ───────────────────────────────────────────────
-#[derive(Deserialize, Clone, Default)]
+fn default_true() -> bool { true }
+
+#[derive(Deserialize, Clone)]
 struct Config {
+    #[serde(default)]
     model_size: String,
+    #[serde(default = "default_true")]
     ram_saving: bool,
+    #[serde(default)]
     always_visible: bool,
+    /// Capitalise sentence start + (with nlp_correction) proper nouns / German nouns.
+    #[serde(default = "default_true")]
+    auto_capitalize: bool,
+    /// Add terminal '.' or '?' heuristically to each utterance.
+    #[serde(default = "default_true")]
+    auto_punctuate: bool,
+    /// Apply nlprule grammar correction (English and German only).
+    #[serde(default = "default_true")]
+    nlp_correction: bool,
+    /// Load PulseAudio module-echo-cancel (WebRTC noise suppression + AGC).
+    #[serde(default)]
+    audio_enhancement: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model_size: String::new(),
+            ram_saving: true,
+            always_visible: false,
+            auto_capitalize: true,
+            auto_punctuate: true,
+            nlp_correction: true,
+            audio_enhancement: false,
+        }
+    }
 }
 
 // ───────────────────────────────────────────────
@@ -753,6 +1177,12 @@ always_visible = false
     };
     let model_path = format!("{}/.local/share/vosk-models/{}", home, model_folder);
 
+    // Derive and store the voice language once — used by punctuation and
+    // Harper gating throughout the session.
+    let voice_lang = VoiceLang::from_model_size(&config.model_size);
+    VOICE_LANG.with(|c| *c.borrow_mut() = voice_lang);
+    println!("Voice language: {:?}", voice_lang);
+
     unsafe {
         let gctx = glib::MainContext::default().as_ptr() as *mut std::ffi::c_void;
         let glib_mainloop = pa_glib_mainloop_new(gctx);
@@ -785,6 +1215,8 @@ always_visible = false
             pa_stream: ptr::null_mut(),
             is_recording: false,
             is_model_loaded: false,
+            echo_cancel_module_id: None,
+            enhanced_source: None,
         }));
     }
 
@@ -797,6 +1229,64 @@ always_visible = false
         });
     }
 
+    // Store feature toggles in the thread_local so the C audio callback
+    // can read them without needing Rc or config references.
+    FEATURE_FLAGS.with(|f| {
+        *f.borrow_mut() = FeatureFlags {
+            auto_capitalize: config.auto_capitalize,
+            auto_punctuate:  config.auto_punctuate,
+            nlp_correction:  config.nlp_correction,
+        };
+    });
+
+    // Audio enhancement — load PulseAudio echo-cancel module if requested.
+    if config.audio_enhancement {
+        match setup_audio_enhancement() {
+            Some((module_id, source)) => {
+                AUDIO_STATE.with(|cell| {
+                    if let Some(state) = cell.borrow_mut().as_mut() {
+                        state.echo_cancel_module_id = Some(module_id);
+                        state.enhanced_source = Some(source);
+                    }
+                });
+            }
+            None => eprintln!("Audio enhancement requested but unavailable — \
+                               is pulseaudio module-echo-cancel installed?"),
+        }
+    }
+
+    // Pre-load nlprule for English and German only.
+    // Both language binaries are baked into the executable at compile time
+    // via include_bytes! in build.rs, but only the active language is parsed
+    // into RAM here.  All other languages skip this block entirely.
+    if voice_lang.uses_nlprule() {
+        NLPRULE.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            let (tokenizer_bytes, rules_bytes): (&'static [u8], &'static [u8]) = match voice_lang {
+                VoiceLang::German => (
+                    include_bytes!(concat!(env!("OUT_DIR"), "/", tokenizer_filename!("de"))),
+                    include_bytes!(concat!(env!("OUT_DIR"), "/", rules_filename!("de"))),
+                ),
+                _ => (
+                    include_bytes!(concat!(env!("OUT_DIR"), "/", tokenizer_filename!("en"))),
+                    include_bytes!(concat!(env!("OUT_DIR"), "/", rules_filename!("en"))),
+                ),
+            };
+            match (
+                Tokenizer::from_reader(&mut std::io::Cursor::new(tokenizer_bytes)),
+                Rules::from_reader(&mut std::io::Cursor::new(rules_bytes)),
+            ) {
+                (Ok(tokenizer), Ok(rules)) => {
+                    *opt = Some((rules, tokenizer));
+                    println!("nlprule loaded for {:?}", voice_lang);
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("nlprule init failed: {}", e);
+                }
+            }
+        });
+    }
+
     let app = Application::builder()
         .application_id("org.example.voskboard")
         .build();
@@ -805,6 +1295,17 @@ always_visible = false
     let config_clone = config.clone();
     app.connect_activate(move |app| {
         build_ui(app, model_path_clone.clone(), config_clone.clone());
+    });
+
+    // Unload the echo-cancel module on clean shutdown.
+    app.connect_shutdown(|_| {
+        AUDIO_STATE.with(|cell| {
+            if let Some(state) = cell.borrow().as_ref() {
+                if let Some(id) = state.echo_cancel_module_id {
+                    teardown_audio_enhancement(id);
+                }
+            }
+        });
     });
 
     app.run();

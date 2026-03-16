@@ -16,12 +16,45 @@ use serde::{Deserialize, Serialize};
 use toml;
 use glib::{timeout_add_local, ControlFlow};
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Config {
+    #[serde(default)]
     model_size: String,
+    #[serde(default = "default_true")]
     ram_saving: bool,
+    #[serde(default)]
     always_visible: bool,
+    #[serde(default)]
     start_on_boot: bool,
+    /// Capitalise sentence start + proper nouns (via nlprule for en/de).
+    #[serde(default = "default_true")]
+    auto_capitalize: bool,
+    /// Append terminal '.' or '?' to each utterance.
+    #[serde(default = "default_true")]
+    auto_punctuate: bool,
+    /// Apply nlprule grammar correction (English and German only).
+    #[serde(default = "default_true")]
+    nlp_correction: bool,
+    /// Enable PulseAudio WebRTC noise suppression + AGC on the mic.
+    #[serde(default)]
+    audio_enhancement: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model_size: "none".to_string(),
+            ram_saving: true,
+            always_visible: false,
+            start_on_boot: false,
+            auto_capitalize: true,
+            auto_punctuate: true,
+            nlp_correction: true,
+            audio_enhancement: false,
+        }
+    }
 }
 
 const MODEL_BASE_DIR_SUFFIX: &str = ".local/share/vosk-models";
@@ -48,8 +81,22 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("Vboard Configuration")
         .default_width(480)
-        .default_height(500)
         .build();
+
+    // Size the window to fit whatever screen it opens on.
+    // On a phone the display is often only 720–800 px tall.
+    let screen_height = gtk::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_downcast::<gtk::gdk::Monitor>()
+        .map(|m| m.geometry().height())
+        .unwrap_or(600);
+    // Leave a small margin so the window bar / status bar aren't covered.
+    let win_height = (screen_height - 60).max(300);
+    window.set_default_size(480, win_height);
+
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_vexpand(true);
 
     let main_vbox = GtkBox::new(Orientation::Vertical, 12);
     main_vbox.set_margin_start(24);
@@ -61,22 +108,14 @@ fn build_ui(app: &Application) {
 
     let models_base = format!("{}/{}", home, MODEL_BASE_DIR_SUFFIX);
     let _ = fs::create_dir_all(&models_base);
-    println!("DEBUG: models dir = {}", models_base);
 
     let config_dir = format!("{}/.config/voskboard", home);
     let _ = fs::create_dir_all(&config_dir);
     let config_path = format!("{}/config.toml", config_dir);
 
-    // Write a default config if none exists yet
     if !Path::new(&config_path).exists() {
-        let default_config = Config {
-            model_size: "none".to_string(),
-            ram_saving: true,
-            always_visible: false,
-            start_on_boot: false,
-        };
+        let default_config = Config::default();
         let _ = fs::write(&config_path, toml::to_string(&default_config).unwrap_or_default());
-        println!("DEBUG: wrote default config to {}", config_path);
     }
 
     let config_str = fs::read_to_string(&config_path).unwrap_or_default();
@@ -84,14 +123,13 @@ fn build_ui(app: &Application) {
     if config.model_size.is_empty() {
         config.model_size = "none".to_string();
     }
-    // Migrate: re-save so any fields absent in an older config get written back as defaults
+    // Migrate: re-save so any fields absent in an older config get written back.
     let _ = fs::write(&config_path, toml::to_string(&config).unwrap_or_default());
-    println!("DEBUG: loaded config — model={} ram_saving={} always_visible={} start_on_boot={}",
-        config.model_size, config.ram_saving, config.always_visible, config.start_on_boot);
 
     let config_rc = Rc::new(RefCell::new(config));
 
     // ── Model selector ──────────────────────────────────────────────────────
+
     let model_row = create_labeled_row("Vosk Model:");
     let model_combo = ComboBoxText::new();
     model_combo.append_text("small");
@@ -109,21 +147,21 @@ fn build_ui(app: &Application) {
     model_combo.append_text("small-chinese");
     model_combo.append_text("small-japanese");
     match config_rc.borrow().model_size.as_str() {
-        "small"         => model_combo.set_active(Some(0)),
-        "medium"        => model_combo.set_active(Some(1)),
-        "large"         => model_combo.set_active(Some(2)),
-        "small-german"  => model_combo.set_active(Some(3)),
-        "small-russian" => model_combo.set_active(Some(4)),
-        "small-dutch"   => model_combo.set_active(Some(5)),
-        "small-french"  => model_combo.set_active(Some(6)),
-        "small-spanish" => model_combo.set_active(Some(7)),
-        "small-italian" => model_combo.set_active(Some(8)),
-        "small-swedish" => model_combo.set_active(Some(9)),
-        "small-polish"  => model_combo.set_active(Some(10)),
-        "small-korean"  => model_combo.set_active(Some(11)),
-        "small-chinese" => model_combo.set_active(Some(12)),
-        "small-japanese"=> model_combo.set_active(Some(13)),
-        _               => model_combo.set_active(None),
+        "small"          => model_combo.set_active(Some(0)),
+        "medium"         => model_combo.set_active(Some(1)),
+        "large"          => model_combo.set_active(Some(2)),
+        "small-german"   => model_combo.set_active(Some(3)),
+        "small-russian"  => model_combo.set_active(Some(4)),
+        "small-dutch"    => model_combo.set_active(Some(5)),
+        "small-french"   => model_combo.set_active(Some(6)),
+        "small-spanish"  => model_combo.set_active(Some(7)),
+        "small-italian"  => model_combo.set_active(Some(8)),
+        "small-swedish"  => model_combo.set_active(Some(9)),
+        "small-polish"   => model_combo.set_active(Some(10)),
+        "small-korean"   => model_combo.set_active(Some(11)),
+        "small-chinese"  => model_combo.set_active(Some(12)),
+        "small-japanese" => model_combo.set_active(Some(13)),
+        _                => model_combo.set_active(None),
     };
     model_row.append(&model_combo);
 
@@ -132,7 +170,6 @@ fn build_ui(app: &Application) {
     let download_row = GtkBox::new(Orientation::Horizontal, 0);
     download_row.append(&download_btn);
 
-    // Progress area: bar on top, cancel below
     let progress_vbox = GtkBox::new(Orientation::Vertical, 6);
     progress_vbox.set_visible(false);
 
@@ -151,7 +188,7 @@ fn build_ui(app: &Application) {
     let status_label = Label::new(Some(""));
     status_label.set_halign(Align::Center);
 
-    // ── Toggles ─────────────────────────────────────────────────────────────
+    // ── General settings ────────────────────────────────────────────────────
     let ram_switch = Switch::new();
     ram_switch.set_active(config_rc.borrow().ram_saving);
     let ram_row = create_switch_row("RAM Saving Mode", &ram_switch);
@@ -166,6 +203,36 @@ fn build_ui(app: &Application) {
     auto_switch.set_active(boot_active);
     let auto_row = create_switch_row("Start on Boot", &auto_switch);
 
+    // ── Text processing settings ─────────────────────────────────────────────
+    let capitalize_switch = Switch::new();
+    capitalize_switch.set_active(config_rc.borrow().auto_capitalize);
+    let capitalize_row = create_switch_row(
+        "Auto Capitalise  (sentence start)",
+        &capitalize_switch,
+    );
+
+    let punctuate_switch = Switch::new();
+    punctuate_switch.set_active(config_rc.borrow().auto_punctuate);
+    let punctuate_row = create_switch_row(
+        "Auto Punctuate  (adds . or ?)",
+        &punctuate_switch,
+    );
+
+    let nlp_switch = Switch::new();
+    nlp_switch.set_active(config_rc.borrow().nlp_correction);
+    let nlp_row = create_switch_row(
+        "NLP Grammar Correction  (English & German only)",
+        &nlp_switch,
+    );
+
+    // ── Audio settings ───────────────────────────────────────────────────────
+    let audio_switch = Switch::new();
+    audio_switch.set_active(config_rc.borrow().audio_enhancement);
+    let audio_row = create_switch_row(
+        "Enhance Mic  (noise supp + AGC, more ram used)",
+        &audio_switch,
+    );
+
     let service_btn = Button::with_label(get_service_button_label());
     service_btn.set_size_request(220, -1);
     service_btn.set_halign(Align::Center);
@@ -177,50 +244,77 @@ fn build_ui(app: &Application) {
     main_vbox.append(&ram_row);
     main_vbox.append(&visible_row);
     main_vbox.append(&auto_row);
+    main_vbox.append(&capitalize_row);
+    main_vbox.append(&punctuate_row);
+    main_vbox.append(&nlp_row);
+    main_vbox.append(&audio_row);
     main_vbox.append(&service_btn);
 
-    window.set_child(Some(&main_vbox));
-    println!("DEBUG: UI built");
+    scroll.set_child(Some(&main_vbox));
+    window.set_child(Some(&scroll));
 
     // ── Switch save handlers ────────────────────────────────────────────────
     {
-        let config_rc   = config_rc.clone();
-        let config_path = config_path.clone();
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
         ram_switch.connect_state_set(move |_, state| {
-            println!("DEBUG: ram_saving -> {}", state);
             config_rc.borrow_mut().ram_saving = state;
             save_config(&config_path, &config_rc.borrow());
-            false.into() // let GTK update the switch visually
+            false.into()
         });
     }
     {
-        let config_rc   = config_rc.clone();
-        let config_path = config_path.clone();
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
         visible_switch.connect_state_set(move |_, state| {
-            println!("DEBUG: always_visible -> {}", state);
             config_rc.borrow_mut().always_visible = state;
             save_config(&config_path, &config_rc.borrow());
             false.into()
         });
     }
     {
-        let config_rc      = config_rc.clone();
-        let config_path    = config_path.clone();
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
         let autostart_path = autostart_path.clone();
         auto_switch.connect_state_set(move |_, state| {
-            println!("DEBUG: start_on_boot -> {}", state);
             config_rc.borrow_mut().start_on_boot = state;
             save_config(&config_path, &config_rc.borrow());
             if state {
                 if let Err(e) = create_autostart_file(&autostart_path) {
-                    eprintln!("DEBUG: failed to create autostart file: {}", e);
-                } else {
-                    println!("DEBUG: autostart file created at {}", autostart_path);
+                    eprintln!("Failed to create autostart file: {}", e);
                 }
             } else {
                 let _ = fs::remove_file(&autostart_path);
-                println!("DEBUG: autostart file removed");
             }
+            false.into()
+        });
+    }
+    {
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
+        capitalize_switch.connect_state_set(move |_, state| {
+            config_rc.borrow_mut().auto_capitalize = state;
+            save_config(&config_path, &config_rc.borrow());
+            false.into()
+        });
+    }
+    {
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
+        punctuate_switch.connect_state_set(move |_, state| {
+            config_rc.borrow_mut().auto_punctuate = state;
+            save_config(&config_path, &config_rc.borrow());
+            false.into()
+        });
+    }
+    {
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
+        nlp_switch.connect_state_set(move |_, state| {
+            config_rc.borrow_mut().nlp_correction = state;
+            save_config(&config_path, &config_rc.borrow());
+            false.into()
+        });
+    }
+    {
+        let config_rc = config_rc.clone(); let config_path = config_path.clone();
+        audio_switch.connect_state_set(move |_, state| {
+            config_rc.borrow_mut().audio_enhancement = state;
+            save_config(&config_path, &config_rc.borrow());
             false.into()
         });
     }
@@ -241,15 +335,12 @@ fn build_ui(app: &Application) {
         let home          = home.clone();
 
         download_btn.clone().connect_clicked(move |_| {
-            println!("DEBUG: Download button clicked");
-
             let Some(text) = model_combo.active_text() else {
                 status_label.set_text("Please select a model first");
                 return;
             };
             let new_size = text.to_string();
             let current  = config_rc.borrow().model_size.clone();
-            println!("DEBUG: selected={} current={}", new_size, current);
 
             if new_size == current {
                 status_label.set_text("Already using this model");
@@ -286,7 +377,6 @@ fn build_ui(app: &Application) {
 
             let (tx, rx) = mpsc::channel::<DownloadMsg>();
 
-            // ── Poll receiver + update bar every 300 ms on the main thread ──
             let rx_cell       = Rc::new(RefCell::new(Some(rx)));
             let poll_bar      = progress_bar.clone();
             let poll_status   = status_label.clone();
@@ -299,7 +389,6 @@ fn build_ui(app: &Application) {
 
             timeout_add_local(Duration::from_millis(300), move || {
                 let mut done = false;
-
                 if let Some(rx) = rx_cell.borrow().as_ref() {
                     loop {
                         match rx.try_recv() {
@@ -310,12 +399,10 @@ fn build_ui(app: &Application) {
                                 let dl_mb  = downloaded as f64 / 1_048_576.0;
                                 let tot_mb = total      as f64 / 1_048_576.0;
                                 poll_bar.set_text(Some(&format!("{}%  ({:.1} / {:.1} MB)", pct, dl_mb, tot_mb)));
-                                println!("DEBUG: progress {}% ({}/{})", pct, downloaded, total);
                             }
                             Ok(DownloadMsg::Extracting) => {
                                 poll_bar.set_text(Some("Extracting..."));
                                 poll_status.set_text("Extracting model...");
-                                println!("DEBUG: extracting");
                             }
                             Ok(DownloadMsg::Done) => {
                                 poll_bar.set_fraction(1.0);
@@ -326,7 +413,6 @@ fn build_ui(app: &Application) {
                                 poll_btn.set_sensitive(true);
                                 poll_btn.set_label("Download & Set Model");
                                 poll_cancel.set_sensitive(false);
-                                println!("DEBUG: done");
                                 let pv = poll_vbox.clone();
                                 timeout_add_local(Duration::from_secs(4), move || {
                                     pv.set_visible(false);
@@ -341,7 +427,6 @@ fn build_ui(app: &Application) {
                                 poll_btn.set_sensitive(true);
                                 poll_btn.set_label("Download & Set Model");
                                 poll_cancel.set_sensitive(false);
-                                println!("DEBUG: failed: {}", reason);
                                 let pv = poll_vbox.clone();
                                 timeout_add_local(Duration::from_secs(6), move || {
                                     pv.set_visible(false);
@@ -357,7 +442,6 @@ fn build_ui(app: &Application) {
                                 poll_btn.set_label("Download & Set Model");
                                 poll_cancel.set_sensitive(false);
                                 poll_vbox.set_visible(false);
-                                println!("DEBUG: cancelled");
                                 done = true;
                                 break;
                             }
@@ -366,25 +450,17 @@ fn build_ui(app: &Application) {
                         }
                     }
                 }
-
                 if done { rx_cell.borrow_mut().take(); ControlFlow::Break }
                 else    { ControlFlow::Continue }
             });
 
-            // Cancel button
             {
                 let flag = cancel_flag.clone();
-                cancel_btn.connect_clicked(move |_| {
-                    println!("DEBUG: cancel clicked");
-                    flag.store(true, Ordering::SeqCst);
-                });
+                cancel_btn.connect_clicked(move |_| { flag.store(true, Ordering::SeqCst); });
             }
 
-            // ── Worker thread ──────────────────────────────────────────────
-            // Download zip and extract entirely within the user home directory — no root needed
             let url        = url.to_string();
             let folder     = folder.to_string();
-            // Zip lands in /tmp so wget can write it without elevated privileges
             let models_dir = format!("{}/{}", home, MODEL_BASE_DIR_SUFFIX);
             let zip_path   = format!("{}/{}.zip", models_dir, folder);
             let flag       = cancel_flag.clone();
@@ -408,7 +484,6 @@ fn build_ui(app: &Application) {
             };
             if !old_folder.is_empty() {
                 let old_path = format!("{}/{}", models_dir, old_folder);
-                println!("DEBUG: removing old model {}", old_path);
                 let _ = fs::remove_dir_all(&old_path);
             }
 
@@ -418,7 +493,6 @@ fn build_ui(app: &Application) {
                     return;
                 }
 
-                // Step 1: HEAD request to get total size
                 let total_size: u64 = {
                     let out = Command::new("curl").args(["-sI", &url]).output();
                     match out {
@@ -431,9 +505,7 @@ fn build_ui(app: &Application) {
                         Err(_) => 0,
                     }
                 };
-                println!("DEBUG: total_size={} bytes", total_size);
 
-                // Step 2: spawn wget — writes to /tmp, no root needed
                 let mut wget = match Command::new("wget")
                     .arg(&url).arg("-O").arg(&zip_path)
                     .stdout(Stdio::null()).stderr(Stdio::null())
@@ -445,12 +517,9 @@ fn build_ui(app: &Application) {
                         return;
                     }
                 };
-                println!("DEBUG: wget spawned -> {}", zip_path);
 
-                // Step 3: poll partial file size every 500 ms
                 loop {
                     if flag.load(Ordering::SeqCst) {
-                        println!("DEBUG: cancel flag — killing wget");
                         let _ = wget.kill();
                         let _ = fs::remove_file(&zip_path);
                         let _ = tx.send(DownloadMsg::Cancelled);
@@ -462,7 +531,6 @@ fn build_ui(app: &Application) {
 
                     match wget.try_wait() {
                         Ok(Some(status)) => {
-                            println!("DEBUG: wget exited {:?}", status);
                             if !status.success() {
                                 let _ = tx.send(DownloadMsg::Failed(
                                     format!("wget failed (code {:?})", status.code())
@@ -481,18 +549,14 @@ fn build_ui(app: &Application) {
                     std::thread::sleep(Duration::from_millis(500));
                 }
 
-                // Step 4: unzip into ~/.local/share/vosk-models/ — no root needed
                 let _ = tx.send(DownloadMsg::Extracting);
-                println!("DEBUG: starting unzip into {}", models_dir);
                 let unzip_ok = Command::new("unzip")
                     .args(["-o", &zip_path, "-d", &models_dir])
                     .stdout(Stdio::null()).stderr(Stdio::null())
                     .status()
                     .map_or(false, |s| s.success());
 
-                // Step 5: delete the zip from /tmp (no root needed)
                 let _ = fs::remove_file(&zip_path);
-                println!("DEBUG: zip removed, unzip ok={}", unzip_ok);
 
                 if unzip_ok {
                     let _ = tx.send(DownloadMsg::Done);
@@ -509,33 +573,19 @@ fn build_ui(app: &Application) {
     {
         let service_btn_c = service_btn.clone();
         service_btn.connect_clicked(move |_| {
-            println!("DEBUG: service button clicked");
             if is_voskboard_running() {
-                println!("DEBUG: stopping voskboard");
-                let pids_out = Command::new("pgrep")
-                    .args(["-x", "voskboard"])
-                    .output();
+                let pids_out = Command::new("pgrep").args(["-x", "voskboard"]).output();
                 if let Ok(o) = pids_out {
                     let pids: Vec<String> = String::from_utf8_lossy(&o.stdout)
                         .lines()
                         .map(|l| l.trim().to_string())
                         .filter(|l| !l.is_empty())
                         .collect();
-                    println!("DEBUG: pids to kill: {:?}", pids);
                     for pid in &pids {
-                        let result = Command::new("kill")
-                            .args(["-9", pid])
-                            .output();
-                        match result {
-                            Ok(o) => println!("DEBUG: kill -9 {} exit={} stderr={:?}", pid, o.status, String::from_utf8_lossy(&o.stderr).trim()),
-                            Err(e) => println!("DEBUG: kill -9 {} error: {}", pid, e),
-                        }
+                        let _ = Command::new("kill").args(["-9", pid]).output();
                     }
                 }
             } else {
-                println!("DEBUG: starting voskboard");
-                // setsid detaches voskboard into its own session so vboard
-                // is not its parent — init adopts it and reaps it on exit
                 let _ = Command::new("setsid")
                     .arg("voskboard")
                     .stdout(Stdio::null())
@@ -543,32 +593,18 @@ fn build_ui(app: &Application) {
                     .stdin(Stdio::null())
                     .spawn();
             }
-            // Poll every 400 ms up to 10 times (4 sec) until the process state
-            // matches what we expect, then update the label. This handles slow
-            // start and slow stop without getting stuck.
-            let btn        = service_btn_c.clone();
-            let attempts   = Rc::new(RefCell::new(0u32));
+            let btn      = service_btn_c.clone();
+            let attempts = Rc::new(RefCell::new(0u32));
             timeout_add_local(Duration::from_millis(400), move || {
                 let running = is_voskboard_running();
-                let attempt = {
-                    let mut a = attempts.borrow_mut();
-                    *a += 1;
-                    *a
-                };
-                println!("DEBUG: poll {} — running={}", attempt, running);
+                let attempt = { let mut a = attempts.borrow_mut(); *a += 1; *a };
                 btn.set_label(if running { "Stop Service" } else { "Start Service" });
-                // Keep polling until state is stable or we've tried 10 times
-                if attempt >= 10 {
-                    ControlFlow::Break
-                } else {
-                    ControlFlow::Continue
-                }
+                if attempt >= 10 { ControlFlow::Break } else { ControlFlow::Continue }
             });
         });
     }
 
     window.present();
-    println!("DEBUG: window presented");
 }
 
 fn create_labeled_row(text: &str) -> GtkBox {
@@ -588,7 +624,6 @@ fn create_switch_row(text: &str, switch: &Switch) -> GtkBox {
 }
 
 fn save_config(path: &str, config: &Config) {
-    println!("DEBUG: saving config to {}", path);
     let _ = fs::write(path, toml::to_string(config).unwrap_or_default());
 }
 
@@ -602,39 +637,25 @@ fn create_autostart_file(path: &str) -> io::Result<()> {
 }
 
 fn is_voskboard_running() -> bool {
-    let out = Command::new("pgrep")
-        .args(["-x", "voskboard"])
-        .output();
+    let out = Command::new("pgrep").args(["-x", "voskboard"]).output();
     match out {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // Filter out zombie processes — they still appear in pgrep after kill
-            // until the parent reaps them, but they are not actually running
             let live_pids: Vec<&str> = stdout.lines()
                 .map(|l| l.trim())
                 .filter(|pid| {
                     if pid.is_empty() { return false; }
                     let status_path = format!("/proc/{}/status", pid);
-                    let state = fs::read_to_string(&status_path)
-                        .unwrap_or_default();
-                    let is_zombie = state.lines()
+                    let state = fs::read_to_string(&status_path).unwrap_or_default();
+                    !state.lines()
                         .find(|l| l.starts_with("State:"))
                         .map(|l| l.contains('Z'))
-                        .unwrap_or(false);
-                    if is_zombie {
-                        println!("DEBUG: pid {} is a zombie, ignoring", pid);
-                    }
-                    !is_zombie
+                        .unwrap_or(false)
                 })
                 .collect();
-            let running = !live_pids.is_empty();
-            println!("DEBUG: pgrep -x voskboard -> running={} live_pids={:?}", running, live_pids);
-            running
+            !live_pids.is_empty()
         }
-        Err(e) => {
-            println!("DEBUG: pgrep failed: {}", e);
-            false
-        }
+        Err(_) => false,
     }
 }
 
