@@ -17,3 +17,4 @@ Features:
 * NLP Grammar correction for German and English (implemented from https://github.com/bminixhofer/nlprule)
 * Mic enhancements for the model to hear you better
 * Auto hides when keyboard is closed, if keyboard is open it reappears (can be disabled with always show button) 
+* All while fitting in aprox 200-250MB of ram! (the expermimental larger models, do not fit that ram margin) 
