@@ -43,7 +43,6 @@ extern "C" {
     fn vosk_recognizer_accept_waveform(recognizer: *mut std::ffi::c_void, data: *const i8, len: u32) -> i32;
     fn vosk_recognizer_result(recognizer: *mut std::ffi::c_void) -> *const i8;
     fn vosk_recognizer_partial_result(recognizer: *mut std::ffi::c_void) -> *const i8;
-    fn vosk_recognizer_reset(recognizer: *mut std::ffi::c_void);
     fn vosk_model_free(model: *mut std::ffi::c_void);
     fn vosk_recognizer_free(recognizer: *mut std::ffi::c_void);
 }
@@ -82,7 +81,6 @@ extern "C" {
     fn pa_stream_peek(s: *mut std::ffi::c_void, data: *mut *const std::ffi::c_void, len: *mut usize) -> i32;
     fn pa_stream_drop(s: *mut std::ffi::c_void);
     fn pa_stream_disconnect(s: *mut std::ffi::c_void) -> i32;
-    fn pa_stream_flush(s: *mut std::ffi::c_void) -> i32;
     fn pa_stream_unref(s: *mut std::ffi::c_void);
     fn pa_strerror(error: i32) -> *const i8;
 }
@@ -114,7 +112,8 @@ struct AudioState {
 
 thread_local! {
     static AUDIO_STATE: RefCell<Option<AudioState>> = RefCell::new(None);
-    // Cached zbus session-bus connection; created once, reused for every OSK poll.
+    // Cached zbus session-bus connection — created once, reused every OSK poll.
+    // The connection is Arc-backed so clone is a ref-count bump, not a reconnect.
     static ZBUS_CONN: RefCell<Option<ZbusConnection>> = RefCell::new(None);
     // Language detected from model_size — drives punctuation and grammar logic.
     static VOICE_LANG: RefCell<VoiceLang> = RefCell::new(VoiceLang::English);
@@ -393,23 +392,29 @@ extern "C" fn audio_callback(_stream: *mut std::ffi::c_void, _nbytes: usize, use
 }
 
 fn clean_vosk_text(json: &str) -> String {
-    let mut s = json.trim().to_string();
-    let start_patterns = ["\"text\" : \"", "\"text\":\"", "\"partial\" : \"", "\"partial\":\""];
-    let mut value_start = 0;
-    for pattern in start_patterns.iter() {
-        if let Some(idx) = s.find(pattern) {
-            value_start = idx + pattern.len();
-            break;
+    let s = json.trim();
+    // Find the value portion in a single pass without intermediate allocations.
+    // Try each possible key prefix and extract the slice between the quotes.
+    let value_start = [
+        "\"text\" : \"", "\"text\":\"",
+        "\"partial\" : \"", "\"partial\":\"",
+    ]
+    .iter()
+    .find_map(|pat| s.find(pat).map(|i| i + pat.len()));
+
+    let inner = match value_start {
+        Some(start) => {
+            let after = &s[start..];
+            match after.find('"') {
+                Some(end) => &after[..end],
+                None => after,
+            }
         }
-    }
-    if value_start == 0 {
-        return s.trim_matches(&['{', '}', '"', ':', ' '][..]).to_string();
-    }
-    s = s[value_start..].to_string();
-    if let Some(end) = s.find('"') {
-        s = s[..end].to_string();
-    }
-    s.trim_matches(&['"', ':', ' '][..]).trim().to_string()
+        // Fallback: strip outer braces/quotes
+        None => s.trim_matches(&['{', '}', '"', ':', ' '][..]),
+    };
+
+    inner.trim().to_string()
 }
 
 // ───────────────────────────────────────────────
@@ -424,35 +429,36 @@ fn clean_vosk_text(json: &str) -> String {
 fn add_terminal_punctuation(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return trimmed.to_string();
+        return String::new();
     }
 
     let lang = VOICE_LANG.with(|c| *c.borrow());
 
-    // CJK: leave the text completely untouched — the models sometimes
-    // already include native punctuation, and injecting Western marks
-    // would produce malformed output.
     if !lang.uses_western_punctuation() {
         return trimmed.to_string();
     }
 
-    // Don't double-add punctuation if Vosk already supplied it.
     if matches!(trimmed.chars().last(), Some('.' | '?' | '!' | '…')) {
         return trimmed.to_string();
     }
 
+    // Extract the first word and compare case-insensitively without allocating
+    // a lowercased copy — voice models output ASCII for all non-CJK languages.
     let first_word = trimmed
         .split_whitespace()
         .next()
         .unwrap_or("")
-        .to_lowercase();
-    let first_word = first_word.trim_matches(|c: char| !c.is_alphabetic());
+        .trim_matches(|c: char| !c.is_alphabetic());
 
-    if lang.question_starters().contains(&first_word) {
-        format!("{}?", trimmed)
-    } else {
-        format!("{}.", trimmed)
-    }
+    let is_question = lang
+        .question_starters()
+        .iter()
+        .any(|&s| s.eq_ignore_ascii_case(first_word));
+
+    let mut out = String::with_capacity(trimmed.len() + 1);
+    out.push_str(trimmed);
+    out.push(if is_question { '?' } else { '.' });
+    out
 }
 
 // ───────────────────────────────────────────────
@@ -464,7 +470,13 @@ fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         None    => String::new(),
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        Some(c) => {
+            let upper = c.to_uppercase();
+            let mut out = String::with_capacity(s.len());
+            for uc in upper { out.push(uc); }
+            out.push_str(chars.as_str());
+            out
+        }
     }
 }
 
@@ -532,16 +544,15 @@ wayland_client::delegate_noop!(VkAppData: ignore ZwpVirtualKeyboardV1);
 /// (= Linux evdev 1) so they do not collide with real hardware keys when
 /// processed through this isolated virtual keyboard.
 fn generate_keymap(chars: &[char]) -> String {
-    // Start at XKB 16 (evdev 8).  evdev 0-7 covers kernel-reserved codes
-    // (ESC, digit row, etc.) that some compositors treat specially even with
-    // a custom keymap loaded.  Starting at 16 keeps us well clear of them.
-    const XKB_BASE: usize = 16; // evdev = XKB - 8 = 8
+    const XKB_BASE: usize = 16;
     let max_xkb = (XKB_BASE + chars.len().saturating_sub(1)).max(XKB_BASE) as u32;
-    let mut keycodes = String::new();
-    let mut symbols = String::new();
+
+    // Pre-size: each keycode line is ~25 chars, each symbol line is ~35 chars.
+    let mut keycodes = String::with_capacity(chars.len() * 25);
+    let mut symbols  = String::with_capacity(chars.len() * 35);
 
     for (i, &c) in chars.iter().enumerate() {
-        let xkb_kc = XKB_BASE + i; // evdev = xkb_kc - 8 = i + 8
+        let xkb_kc = XKB_BASE + i;
         let name = format!("VK{:03}", i);
         keycodes.push_str(&format!("        <{}> = {};\n", name, xkb_kc));
         symbols.push_str(&format!("        key <{}> {{ [ U{:04X} ] }};\n", name, c as u32));
@@ -579,19 +590,22 @@ fn insert_text_into_focused_field(text: &str) {
     }
 
     // Prepend a space so dictated words don't run into existing text.
-    let text_spaced = format!(" {}", text);
+    let mut text_spaced = String::with_capacity(text.len() + 1);
+    text_spaced.push(' ');
+    text_spaced.push_str(text);
 
-    // Collect unique characters (first-occurrence order).
-    let mut seen = std::collections::HashSet::new();
+    let char_count = text_spaced.chars().count();
+
+    // Collect unique characters preserving first-occurrence order.
+    let mut seen = std::collections::HashSet::with_capacity(char_count.min(96));
     let unique: Vec<char> = text_spaced.chars().filter(|c| seen.insert(*c)).collect();
+    drop(seen); // free the HashSet immediately — not needed after this point
 
-    // Map each unique char to an evdev keycode.
-    //   XKB keycode = index + 16  →  evdev keycode = XKB - 8 = index + 8
-    let char_to_kc: HashMap<char, u32> = unique
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| (c, (i + 8) as u32))
-        .collect();
+    // Map each unique char to an evdev keycode (index + 8).
+    let mut char_to_kc: HashMap<char, u32> = HashMap::with_capacity(unique.len());
+    for (i, &c) in unique.iter().enumerate() {
+        char_to_kc.insert(c, (i + 8) as u32);
+    }
 
     let keymap_str = generate_keymap(&unique);
 
@@ -713,29 +727,31 @@ fn get_or_init_zbus() -> Option<ZbusConnection> {
                 Err(e) => eprintln!("zbus: session connection failed: {}", e),
             }
         }
-        // ZbusConnection is Arc-backed, so clone is cheap.
         opt.clone()
     })
 }
 
 fn is_osk_visible() -> bool {
-    let conn = match get_or_init_zbus() {
-        Some(c) => c,
-        None => return false,
+    let Some(conn) = get_or_init_zbus() else { return false };
+    use zbus::blocking::fdo::PropertiesProxy;
+    // PropertiesProxy is a thin wrapper (~2 heap words); building it per-poll
+    // is negligible. The expensive part was the connection itself, which is
+    // cached above. The 'static bound is satisfied by the cloned Arc connection.
+    let proxy = match PropertiesProxy::builder(&conn)
+        .destination("sm.puri.OSK0")
+        .and_then(|b| b.path("/sm/puri/OSK0"))
+        .and_then(|b| b.build())
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zbus: OSK proxy build failed: {}", e);
+            return false;
+        }
     };
-
-    let result: Result<bool, Box<dyn std::error::Error>> = (|| {
-        use zbus::blocking::fdo::PropertiesProxy;
-        let proxy = PropertiesProxy::builder(&conn)
-            .destination("sm.puri.OSK0")?
-            .path("/sm/puri/OSK0")?
-            .build()?;
-        let val = proxy.get("sm.puri.OSK0".try_into()?, "Visible")?;
-        Ok(bool::try_from(val)?)
-    })();
-
-    match result {
-        Ok(v) => {
+    let iface: zbus::names::InterfaceName = "sm.puri.OSK0".try_into().expect("valid interface name");
+    match proxy.get(iface, "Visible") {
+        Ok(val) => {
+            let v = bool::try_from(val).unwrap_or(false);
             println!("OSK Visible: {}", v);
             v
         }
@@ -792,6 +808,10 @@ fn unload_vosk_model(state: &mut AudioState) {
             vosk_model_free(state.model);
             state.model = ptr::null_mut();
         }
+        // Force glibc to return freed heap pages back to the kernel.
+        // Without this, freed memory stays in glibc's internal free-list
+        // and RSS remains high even though the model is logically gone.
+        libc::malloc_trim(0);
     }
     state.is_model_loaded = false;
     println!("Vosk model unloaded");
@@ -887,8 +907,8 @@ fn start_recording(model_path: &str, config: &Config) {
             }
             unsafe {
                 if !state.pa_stream.is_null() {
+                    pa_stream_set_read_callback(state.pa_stream, None, ptr::null_mut());
                     pa_stream_disconnect(state.pa_stream);
-                    pa_stream_flush(state.pa_stream);
                     pa_stream_unref(state.pa_stream);
                     state.pa_stream = ptr::null_mut();
                 }
@@ -933,16 +953,45 @@ fn stop_recording(config: &Config) {
             }
             unsafe {
                 if !state.pa_stream.is_null() {
+                    // Null the callback BEFORE disconnect. The GLib mainloop
+                    // may already have a callback queued; nulling here makes
+                    // it a no-op rather than hitting a freed recognizer.
+                    pa_stream_set_read_callback(state.pa_stream, None, ptr::null_mut());
                     pa_stream_disconnect(state.pa_stream);
-                    pa_stream_flush(state.pa_stream);
+                    // Do NOT call pa_stream_flush after disconnect — it is an
+                    // async op only valid on a live stream and causes SIGBUS.
                     pa_stream_unref(state.pa_stream);
                     state.pa_stream = ptr::null_mut();
                 }
             }
             state.is_recording = false;
             println!("Recording stopped");
+
             if config.ram_saving {
+                // Frees recognizer + model + calls malloc_trim internally.
                 unload_vosk_model(state);
+            } else {
+                // Keep model loaded but free+recreate the recognizer to purge
+                // accumulated Kaldi buffers (feature pipeline, lattice, LSTM
+                // activations). vosk_recognizer_reset() does NOT free these —
+                // only free+new actually reclaims the memory.
+                unsafe {
+                    if !state.recognizer.is_null() {
+                        vosk_recognizer_free(state.recognizer);
+                        state.recognizer = ptr::null_mut();
+                    }
+                    if !state.model.is_null() {
+                        let new_rec = vosk_recognizer_new(state.model, SAMPLE_RATE as f32);
+                        if new_rec.is_null() {
+                            eprintln!("Failed to recreate Vosk recognizer");
+                            state.is_model_loaded = false;
+                        } else {
+                            state.recognizer = new_rec;
+                            println!("Vosk recognizer recycled");
+                        }
+                    }
+                    libc::malloc_trim(0);
+                }
             }
         }
     });
@@ -1075,8 +1124,36 @@ fn build_ui(app: &Application, model_path: String, config: Config) {
                 AUDIO_STATE.with(|cell| {
                     let mut opt = cell.borrow_mut();
                     if let Some(state) = opt.as_mut() {
+                        // Always tear down the stream first. If the user was
+                        // recording when the OSK closed, the stream is still
+                        // live. Freeing the recognizer while a callback is
+                        // queued causes a segfault.
+                        if !state.pa_stream.is_null() {
+                            unsafe {
+                                pa_stream_set_read_callback(state.pa_stream, None, ptr::null_mut());
+                                pa_stream_disconnect(state.pa_stream);
+                                pa_stream_unref(state.pa_stream);
+                            }
+                            state.pa_stream = ptr::null_mut();
+                            state.is_recording = false;
+                        }
                         if config_clone2.ram_saving {
                             unload_vosk_model(state);
+                        } else if state.is_model_loaded && !state.recognizer.is_null() {
+                            unsafe {
+                                vosk_recognizer_free(state.recognizer);
+                                state.recognizer = ptr::null_mut();
+                                if !state.model.is_null() {
+                                    let new_rec = vosk_recognizer_new(state.model, SAMPLE_RATE as f32);
+                                    state.recognizer = if new_rec.is_null() {
+                                        state.is_model_loaded = false;
+                                        ptr::null_mut()
+                                    } else {
+                                        new_rec
+                                    };
+                                }
+                                libc::malloc_trim(0);
+                            }
                         }
                     }
                 });
